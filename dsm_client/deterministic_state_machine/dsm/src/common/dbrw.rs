@@ -10,7 +10,7 @@
 //!
 //! Production: this module ships a deterministic stub that derives a binding
 //! from the 32-byte DevID (per-device, repeatable). A hardware-backed reader
-//! is a separate follow-up issue (see coverage/genesis-mpc-flow-plan.md §7).
+//! that mixes platform attestation entropy is a future enhancement.
 //!
 //! Tests: when compiled with `cfg(test)`, an alternate path keyed by the
 //! `DSM_TEST_DBRW_SEED` environment variable is honored to enable

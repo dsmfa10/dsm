@@ -336,30 +336,18 @@ pub fn verify_genesis_state(genesis: &GenesisState) -> Result<bool, DsmError> {
     Ok(true)
 }
 
-// -------------------- MPC-only entrypoint --------------------
-
-pub async fn create_genesis_via_blind_mpc(
-    device_id: [u8; 32],
-    storage_nodes: Vec<NodeId>,
-    threshold: usize,
-    metadata: Option<Vec<u8>>,
-) -> Result<GenesisState, DsmError> {
-    let session = crate::core::identity::genesis_mpc::create_mpc_genesis(
-        device_id,
-        storage_nodes,
-        threshold,
-        metadata,
-    )
-    .await?;
-
-    let gs = convert_session_to_genesis_state_compat(&session)?;
-    if !verify_genesis_state(&gs)? {
-        return Err(DsmError::invalid_operation(
-            "MPC genesis verification failed",
-        ));
-    }
-    Ok(gs)
-}
+// -------------------- MPC entrypoints --------------------
+//
+// Genesis MPC creation is intrinsically online and storage-node-coupled
+// (WP §10, §14; storage-node spec). Every honest path therefore either:
+//   (a) goes through `genesis_mpc::create_mpc_genesis_with_transport` with a
+//       real transport that talks to ≥3 distinct storage nodes (production),
+//   (b) goes through `create_genesis_via_blind_mpc_with_contributors` with
+//       reveals already collected out-of-band (SDK adapter case), or
+//   (c) uses `genesis_mpc::DeterministicTestTransport` under cfg(test).
+//
+// There is no honest local-RNG MPC path; any such function would defeat the
+// threshold security argument and is rejected at the `GenesisA0` boundary.
 
 pub fn create_genesis_via_blind_mpc_with_contributors(
     device_id: [u8; 32],

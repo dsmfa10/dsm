@@ -365,29 +365,7 @@ pub fn generate_device_entropy(device_id: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-// -------------------- High-level MPC creation (no I/O) --------------------
-
-/// Production DSM MPC Creation (bytes-only) using deterministic device entropy.
-///
-/// **WARNING**: this entrypoint is suitable only when the caller provides a
-/// transport. The local-RNG "modeled" path was removed because pseudo-MPC
-/// entropy from a single device defeats the threshold security argument
-/// (audit finding H4). Callers must use
-/// [`create_mpc_genesis_with_transport`] instead — the only path that gathers
-/// real reveals from independent storage nodes.
-#[deprecated(
-    note = "Use create_mpc_genesis_with_transport: the local-RNG path violates the MPC threshold contract"
-)]
-pub async fn create_mpc_genesis(
-    _device_id: [u8; 32],
-    _storage_nodes: Vec<NodeId>,
-    _threshold: usize,
-    _metadata: Option<Vec<u8>>,
-) -> Result<GenesisSession, DsmError> {
-    Err(DsmError::invalid_operation(
-        "create_mpc_genesis: local-RNG MPC path removed; use create_mpc_genesis_with_transport",
-    ))
-}
+// -------------------- High-level MPC creation (transport-driven only) --------------------
 
 /// SDK-integrated two-phase MPC genesis creation. Collects every commit
 /// from the sorted participant set BEFORE any reveal is solicited
@@ -776,15 +754,5 @@ mod tests {
             r.is_err(),
             "bias attack must be rejected by the two-phase verifier"
         );
-    }
-
-    #[tokio::test]
-    #[allow(deprecated)]
-    async fn create_mpc_genesis_local_path_is_disabled() {
-        // The local-RNG path must refuse to run.
-        let dev = id32(0xAA);
-        let nodes = vec![NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")];
-        let r = create_mpc_genesis(dev, nodes, 3, None).await;
-        assert!(r.is_err());
     }
 }
