@@ -29,6 +29,7 @@ const _: () = assert!(
 );
 
 pub mod genesis;
+pub mod genesis_a0;
 pub mod genesis_mpc;
 // hierarchical_device_management deleted: 1180-line module with zero external
 // callers. Its own doc comment noted "DO NOT use this Merkle implementation for
