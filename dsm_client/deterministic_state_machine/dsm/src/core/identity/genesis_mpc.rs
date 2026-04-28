@@ -149,10 +149,6 @@ pub struct GenesisSession {
     pub mpc_entropies: Vec<[u8; 32]>,
     /// Session metadata (opaque bytes)
     pub metadata: Vec<u8>,
-    /// Commitments C_i = H(session_id || contribution_i_material)
-    pub commitments: Vec<[u8; 32]>,
-    /// Reveals: exact contribution materials used for each commitment
-    pub reveals: Vec<Vec<u8>>,
     /// Final genesis id: H(session_id || device_entropy || mpc_i... || metadata)
     pub genesis_id: [u8; 32],
     /// Participants
@@ -179,8 +175,6 @@ impl GenesisSession {
             dbrw_binding: None,
             mpc_entropies: Vec::new(),
             metadata,
-            commitments: Vec::new(),
-            reveals: Vec::new(),
             genesis_id: [0u8; 32],
             storage_nodes: Vec::new(),
             threshold: 0,
@@ -219,52 +213,6 @@ impl GenesisSession {
         self.device_entropy = device_entropy;
         self.mpc_entropies = mpc_entropies;
         Ok(())
-    }
-
-    /// Compute commitments: C_i = H(session_id || contribution)
-    /// contributions = [device_entropy, mpc_i...]
-    pub fn compute_commitments(&mut self) {
-        let mut contributions: Vec<Vec<u8>> = Vec::new();
-
-        // Device contribution (DBRW is not part of genesis binding)
-        contributions.push(self.device_entropy.to_vec());
-
-        // MPC contributions
-        for m in &self.mpc_entropies {
-            contributions.push(m.to_vec());
-        }
-
-        self.commitments = contributions
-            .iter()
-            .map(|c| {
-                let mut h = dsm_domain_hasher("DSM/genesis-mpc");
-                h.update(&self.session_id);
-                h.update(c);
-                let mut out = [0u8; 32];
-                out.copy_from_slice(h.finalize().as_bytes());
-                out
-            })
-            .collect();
-
-        self.reveals = contributions;
-    }
-
-    /// Verify commitments against reveals
-    pub fn verify_commitments(&self) -> bool {
-        if self.commitments.len() != self.reveals.len() {
-            return false;
-        }
-        for (rev, com) in self.reveals.iter().zip(self.commitments.iter()) {
-            let mut h = dsm_domain_hasher("DSM/genesis-mpc");
-            h.update(&self.session_id);
-            h.update(rev);
-            let mut out = [0u8; 32];
-            out.copy_from_slice(h.finalize().as_bytes());
-            if &out != com {
-                return false;
-            }
-        }
-        true
     }
 
     /// Compute genesis id via the canonical [`GenesisA0`] anchor (WP §2.5).
@@ -323,11 +271,6 @@ impl GenesisSession {
         if self.mpc_entropies.len() != self.storage_nodes.len() {
             return Err(DsmError::invalid_operation(
                 "MPC entropy count must equal node count",
-            ));
-        }
-        if !self.verify_commitments() {
-            return Err(DsmError::invalid_operation(
-                "Commitment verification failed",
             ));
         }
         let a0 = self.build_a0()?;
@@ -454,7 +397,6 @@ pub async fn run_two_phase_mpc<T: GenesisMpcTransport + Sync>(
     }
 
     session.mpc_entropies = reveals;
-    session.compute_commitments();
     session.compute_genesis_id()?;
     session.validate_session()?;
     Ok(())
@@ -612,10 +554,6 @@ mod tests {
         // DBRW may exist, but doesn't affect genesis binding
         s.dbrw_binding = Some(id32(0xDB));
 
-        s.compute_commitments();
-        assert_eq!(s.commitments.len(), 1 + s.mpc_entropies.len());
-        assert!(s.verify_commitments());
-
         s.compute_genesis_id().unwrap();
         assert_ne!(s.genesis_id, [0u8; 32]);
         s.validate_session().unwrap();
@@ -629,7 +567,6 @@ mod tests {
         s1.initialize_mpc(id32(1), nodes.clone(), 3).unwrap();
         s1.device_entropy = id32(2);
         s1.mpc_entropies = vec![id32(10), id32(11), id32(12)];
-        s1.compute_commitments();
         s1.compute_genesis_id().unwrap();
 
         let mut s2 = GenesisSession::new(b"m".to_vec()).unwrap();
@@ -645,7 +582,6 @@ mod tests {
         s2.initialize_mpc(id32(1), nodes4, 4).unwrap();
         s2.device_entropy = id32(2);
         s2.mpc_entropies = vec![id32(10), id32(11), id32(12), id32(13)];
-        s2.compute_commitments();
         s2.compute_genesis_id().unwrap();
 
         assert_ne!(s1.genesis_id, s2.genesis_id);
@@ -662,7 +598,6 @@ mod tests {
         .unwrap();
         s.device_entropy = id32(11);
         s.mpc_entropies = vec![id32(21), id32(22), id32(23)];
-        s.compute_commitments();
         s.compute_genesis_id().unwrap();
         s.genesis_id[0] ^= 0xFF;
         assert!(s.validate_session().is_err());
@@ -684,7 +619,6 @@ mod tests {
         .await
         .expect("two-phase MPC should succeed");
         assert_ne!(s.genesis_id, [0u8; 32]);
-        assert!(s.verify_commitments());
         // Participants must come back sorted bytewise.
         let names: Vec<&[u8]> = s.storage_nodes.iter().map(|n| n.as_bytes()).collect();
         let expected: Vec<&[u8]> = vec![b"n1", b"n2", b"n3"];

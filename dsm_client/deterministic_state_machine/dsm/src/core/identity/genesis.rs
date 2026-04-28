@@ -362,7 +362,6 @@ pub fn create_genesis_via_blind_mpc_with_contributors(
     let mut session = crate::core::identity::genesis_mpc::GenesisSession::new(metadata)?;
     session.initialize_mpc(device_id, storage_nodes, threshold)?;
     session.set_entropies(device_entropy, mpc_entropies)?;
-    session.compute_commitments();
     session.compute_genesis_id()?;
     session.validate_session()?;
 
