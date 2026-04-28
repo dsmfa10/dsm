@@ -1669,9 +1669,18 @@ impl StorageNodeSDK {
             ));
         }
 
-        // Gather entropy from storage nodes
+        // Gather entropy from storage nodes. Per detfispecs, genesis MPC has a
+        // hard-coded minimum of 3 participants / 3-of-3 threshold. Reject
+        // loudly rather than silently clamping the caller's threshold.
         let node_urls = self.get_node_urls();
-        let threshold_count = threshold.unwrap_or(3).min(node_urls.len() as u8) as usize;
+        let threshold_count = threshold.unwrap_or(3) as usize;
+
+        if threshold_count < 3 {
+            return Err(DsmError::invalid_operation(format!(
+                "Genesis MPC threshold must be >= 3 (spec floor), got {}",
+                threshold_count
+            )));
+        }
 
         if node_urls.len() < threshold_count {
             return Err(DsmError::invalid_operation(format!(
