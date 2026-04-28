@@ -225,7 +225,7 @@ pub fn derive_pq_keys(
     genesis_id: &[u8; 32],
     devid_a: &[u8; 32],
 ) -> Result<DerivedPqKeys, DsmError> {
-    let k_dbrw = dbrw::binding_for(devid_a);
+    let mut k_dbrw = dbrw::binding_for(devid_a);
 
     // s_master = HKDF-Extract analogue via BLAKE3:
     //   s_master = BLAKE3("DSM/dev\0" || genesis_id || devid_a || K_DBRW)
@@ -250,13 +250,15 @@ pub fn derive_pq_keys(
     let (kyber_pk, kyber_sk) =
         kyber::generate_kyber_keypair_from_entropy(kyber_entropy.as_bytes(), "DSM/genesis-pq")?;
 
-    // Best-effort scrub of intermediate seeds (K_DBRW already dropped via shadowing below).
+    // Best-effort scrub of intermediate seeds. K_DBRW is a Copy [u8;32]; we
+    // hold no other reference, but explicitly zeroize so this stack slot is
+    // wiped before return.
     {
         use zeroize::Zeroize;
         s_master.zeroize();
         sphincs_seed.zeroize();
+        k_dbrw.zeroize();
     }
-    drop(k_dbrw);
 
     Ok(DerivedPqKeys {
         sphincs_pk: sp_kp.public_key.clone(),

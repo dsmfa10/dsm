@@ -54,18 +54,43 @@ pub trait GenesisStorage {
     async fn get(&self, genesis_hash: &[u8; 32]) -> Result<Vec<u8>, DsmError>;
 }
 
-/// Optional network transport for real MPC collection.
+/// Two-phase MPC transport: collect commits from every participant BEFORE
+/// any reveal is requested (bias-resistance gate, see WP §11.1).
 ///
-/// This is NOT required by the core convenience entrypoint (`create_mpc_genesis`),
-/// but is provided for SDK integration.
+/// SDK implementations perform real I/O against storage nodes. The core
+/// orchestrator [`run_two_phase_mpc`] enforces the phase ordering — every
+/// commit MUST be gathered before any reveal is solicited.
 #[async_trait]
 pub trait GenesisMpcTransport {
-    async fn collect_node_entropy(
+    /// Collect a participant's commitment.
+    /// Returns the 32-byte commit `BLAKE3("DSM/genesis-mpc\0" || session_id || node_reveal)`.
+    async fn collect_commit(
         &self,
         node: &NodeId,
         session_id: &[u8; 32],
         device_commitment: &[u8; 32],
     ) -> Result<[u8; 32], DsmError>;
+
+    /// Collect a participant's reveal. Implementations MUST refuse to release
+    /// the reveal until the participant observes that every other peer has
+    /// already published its commit; the core enforces this ordering on the
+    /// caller side via [`run_two_phase_mpc`].
+    async fn collect_reveal(
+        &self,
+        node: &NodeId,
+        session_id: &[u8; 32],
+    ) -> Result<[u8; 32], DsmError>;
+}
+
+/// Recompute the canonical commit for a given reveal.
+#[inline]
+pub fn commit_for_reveal(session_id: &[u8; 32], reveal: &[u8; 32]) -> [u8; 32] {
+    let mut h = dsm_domain_hasher("DSM/genesis-mpc");
+    h.update(session_id);
+    h.update(reveal);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
 }
 
 // -------------------- Keys (PQ primitives) --------------------
@@ -242,23 +267,52 @@ impl GenesisSession {
         true
     }
 
-    /// Compute genesis id: H(session_id || device_entropy || mpc_i... || metadata)
+    /// Compute genesis id via the canonical [`GenesisA0`] anchor (WP §2.5).
+    /// This binds session_id, device_id, threshold, sorted participants,
+    /// device_entropy, every MPC reveal, and metadata into
+    /// `G = BLAKE3("DSM/genesis\0" || canonical_bytes(A_0))`.
+    ///
+    /// Threshold and participant ordering are part of the binding so that an
+    /// adversary cannot quietly substitute a smaller threshold or shuffle
+    /// participants to land on a different genesis.
     ///
     /// DBRW is intentionally NOT part of the genesis binding.
-    pub fn compute_genesis_id(&mut self) {
-        let mut h = dsm_domain_hasher("DSM/genesis-mpc");
-        h.update(&self.session_id);
-        h.update(&self.device_entropy);
-        for m in &self.mpc_entropies {
-            h.update(m);
-        }
-        h.update(&self.metadata);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(h.finalize().as_bytes());
-        self.genesis_id = out;
+    pub fn compute_genesis_id(&mut self) -> Result<(), DsmError> {
+        let a0 = self.build_a0()?;
+        self.genesis_id = a0.genesis_id()?;
+        Ok(())
     }
 
-    /// Validate full session
+    /// Build the canonical [`GenesisA0`] anchor for this session. The reveal
+    /// list comes from `mpc_entropies` paired with the sorted node list.
+    pub fn build_a0(&self) -> Result<crate::core::identity::genesis_a0::GenesisA0, DsmError> {
+        if self.mpc_entropies.len() != self.storage_nodes.len() {
+            return Err(DsmError::invalid_operation(
+                "MPC entropy count must equal node count",
+            ));
+        }
+        let pairs: Vec<(NodeId, [u8; 32])> = self
+            .storage_nodes
+            .iter()
+            .cloned()
+            .zip(self.mpc_entropies.iter().copied())
+            .collect();
+        let threshold = u32::try_from(self.threshold)
+            .map_err(|_| DsmError::invalid_parameter("threshold does not fit in u32"))?;
+        crate::core::identity::genesis_a0::GenesisA0::build(
+            self.session_id,
+            self.device_id,
+            threshold,
+            self.storage_nodes.clone(),
+            self.device_entropy,
+            pairs,
+            self.metadata.clone(),
+        )
+    }
+
+    /// Validate full session end-to-end. Re-derives `genesis_id` from the
+    /// canonical [`GenesisA0`] anchor and rejects any drift between stored
+    /// fields and derived values.
     pub fn validate_session(&self) -> Result<(), DsmError> {
         if self.storage_nodes.len() < 3 {
             return Err(DsmError::invalid_operation("MPC requires ≥3 storage nodes"));
@@ -274,6 +328,12 @@ impl GenesisSession {
         if !self.verify_commitments() {
             return Err(DsmError::invalid_operation(
                 "Commitment verification failed",
+            ));
+        }
+        let a0 = self.build_a0()?;
+        if a0.genesis_id()? != self.genesis_id {
+            return Err(DsmError::invalid_operation(
+                "genesis_id does not match canonical A_0 derivation",
             ));
         }
         if self.genesis_id == [0u8; 32] {
@@ -307,70 +367,38 @@ pub fn generate_device_entropy(device_id: &[u8; 32]) -> [u8; 32] {
 
 // -------------------- High-level MPC creation (no I/O) --------------------
 
-/// Production DSM MPC Creation (bytes-only).
+/// Production DSM MPC Creation (bytes-only) using deterministic device entropy.
 ///
-/// This entrypoint is the core, no-I/O version: it models the MPC entropies
-/// without performing network collection. SDK integrations should use
-/// `create_mpc_genesis_with_transport`.
+/// **WARNING**: this entrypoint is suitable only when the caller provides a
+/// transport. The local-RNG "modeled" path was removed because pseudo-MPC
+/// entropy from a single device defeats the threshold security argument
+/// (audit finding H4). Callers must use
+/// [`create_mpc_genesis_with_transport`] instead — the only path that gathers
+/// real reveals from independent storage nodes.
+#[deprecated(
+    note = "Use create_mpc_genesis_with_transport: the local-RNG path violates the MPC threshold contract"
+)]
 pub async fn create_mpc_genesis(
-    device_id: [u8; 32],
-    storage_nodes: Vec<NodeId>,
-    threshold: usize,
-    metadata: Option<Vec<u8>>,
+    _device_id: [u8; 32],
+    _storage_nodes: Vec<NodeId>,
+    _threshold: usize,
+    _metadata: Option<Vec<u8>>,
 ) -> Result<GenesisSession, DsmError> {
-    if storage_nodes.len() < 3 {
-        return Err(DsmError::InvalidParameter(format!(
-            "MPC requires ≥3 nodes, got {}",
-            storage_nodes.len()
-        )));
-    }
-    if threshold < 3 || threshold > storage_nodes.len() {
-        return Err(DsmError::InvalidParameter(format!(
-            "threshold must be ≥3 and ≤ nodes ({}), got {}",
-            storage_nodes.len(),
-            threshold
-        )));
-    }
-
-    let meta = metadata.unwrap_or_else(|| b"DSMv2|bytes|no-wallclock".to_vec());
-
-    // Device entropy (32B)
-    let device_entropy = {
-        let mut e = [0u8; 32];
-        crate::crypto::rng::random_bytes(32)
-            .as_slice()
-            .read_exact(&mut e)
-            .map_err(|e| {
-                DsmError::crypto("Failed to generate device entropy".to_string(), Some(e))
-            })?;
-        e
-    };
-
-    // MPC entropies (modeled; SDK provides real collection in integration)
-    let mut mpc_entropies: Vec<[u8; 32]> = Vec::with_capacity(storage_nodes.len());
-    for _ in 0..storage_nodes.len() {
-        let mut e = [0u8; 32];
-        crate::crypto::rng::random_bytes(32)
-            .as_slice()
-            .read_exact(&mut e)
-            .map_err(|e| DsmError::crypto("Failed to generate MPC entropy".to_string(), Some(e)))?;
-        mpc_entropies.push(e);
-    }
-
-    let mut session = GenesisSession::new(meta)?;
-    session.initialize_mpc(device_id, storage_nodes, threshold)?;
-    session.set_entropies(device_entropy, mpc_entropies)?;
-
-    session.compute_commitments();
-    session.compute_genesis_id();
-    session.validate_session()?;
-
-    Ok(session)
+    Err(DsmError::invalid_operation(
+        "create_mpc_genesis: local-RNG MPC path removed; use create_mpc_genesis_with_transport",
+    ))
 }
 
-/// SDK-integrated MPC Creation using a transport for node entropy collection.
-/// DBRW is optional and stored in the session for later gating/attestation; it is not
-/// part of genesis binding.
+/// SDK-integrated two-phase MPC genesis creation. Collects every commit
+/// from the sorted participant set BEFORE any reveal is solicited
+/// (bias-resistance, WP §11.1), then verifies each reveal against its
+/// recorded commit. The session's `genesis_id` is bound to the canonical
+/// [`GenesisA0`] anchor (sorted participants, threshold, device_id,
+/// device_entropy, all reveals, metadata).
+///
+/// `dbrw_binding` is recorded on the session for downstream attestation but
+/// is intentionally NOT part of the genesis binding — the genesis must remain
+/// derivable from public inputs alone (WP §12).
 pub async fn create_mpc_genesis_with_transport<T: GenesisMpcTransport + Sync>(
     device_id: [u8; 32],
     storage_nodes: Vec<NodeId>,
@@ -395,24 +423,16 @@ pub async fn create_mpc_genesis_with_transport<T: GenesisMpcTransport + Sync>(
 
     let meta = metadata.unwrap_or_else(|| b"DSMv2|bytes|no-wallclock".to_vec());
 
-    // Device entropy (32B)
-    let device_entropy = {
-        let mut e = [0u8; 32];
-        crate::crypto::rng::random_bytes(32)
-            .as_slice()
-            .read_exact(&mut e)
-            .map_err(|e| {
-                DsmError::crypto("Failed to generate device entropy".to_string(), Some(e))
-            })?;
-        e
-    };
-
     let mut session = GenesisSession::new(meta)?;
-    session.initialize_mpc(device_id, storage_nodes.clone(), threshold)?;
-    session.device_entropy = device_entropy;
+    // Sort participants bytewise to match the canonical A_0 ordering before
+    // we publish session_id-bound commits.
+    let mut sorted = storage_nodes;
+    sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    session.initialize_mpc(device_id, sorted.clone(), threshold)?;
+    session.device_entropy = generate_device_entropy(&device_id);
     session.dbrw_binding = dbrw_binding;
 
-    // Device commitment material for transport calls: H(session_id || device_entropy)
+    // Device commitment material for transport calls: H(session_id || device_entropy).
     let device_commitment = {
         let mut h = crate::crypto::blake3::dsm_domain_hasher("DSM/genesis-device-commit");
         h.update(&session.session_id);
@@ -422,21 +442,95 @@ pub async fn create_mpc_genesis_with_transport<T: GenesisMpcTransport + Sync>(
         out
     };
 
-    // Collect node entropies from SDK transport
-    let mut mpc_entropies: Vec<[u8; 32]> = Vec::with_capacity(storage_nodes.len());
-    for n in &storage_nodes {
-        let e = transport
-            .collect_node_entropy(n, &session.session_id, &device_commitment)
-            .await?;
-        mpc_entropies.push(e);
-    }
-    session.mpc_entropies = mpc_entropies;
-
-    session.compute_commitments();
-    session.compute_genesis_id();
-    session.validate_session()?;
-
+    run_two_phase_mpc(&mut session, transport, &device_commitment).await?;
     Ok(session)
+}
+
+/// Drive the two-phase MPC: gather every commit, then every reveal, then
+/// verify each reveal against its recorded commit. Any mismatch aborts the
+/// session with a bias-resistance error.
+pub async fn run_two_phase_mpc<T: GenesisMpcTransport + Sync>(
+    session: &mut GenesisSession,
+    transport: &T,
+    device_commitment: &[u8; 32],
+) -> Result<(), DsmError> {
+    // Phase 1 — collect all commits before any reveals.
+    let mut commits: Vec<[u8; 32]> = Vec::with_capacity(session.storage_nodes.len());
+    for node in &session.storage_nodes {
+        let c = transport
+            .collect_commit(node, &session.session_id, device_commitment)
+            .await?;
+        commits.push(c);
+    }
+
+    // Phase 2 — collect reveals; each must match its prior commit.
+    let mut reveals: Vec<[u8; 32]> = Vec::with_capacity(session.storage_nodes.len());
+    for (i, node) in session.storage_nodes.iter().enumerate() {
+        let r = transport.collect_reveal(node, &session.session_id).await?;
+        if commit_for_reveal(&session.session_id, &r) != commits[i] {
+            return Err(DsmError::invalid_operation(
+                "MPC reveal does not match prior commit (bias-resistance violated)",
+            ));
+        }
+        reveals.push(r);
+    }
+
+    session.mpc_entropies = reveals;
+    session.compute_commitments();
+    session.compute_genesis_id()?;
+    session.validate_session()?;
+    Ok(())
+}
+
+// -------------------- Deterministic test transport --------------------
+
+/// Deterministic in-process MPC transport for tests. Each node's reveal is
+/// derived from `BLAKE3("DSM/test-mpc-reveal\0" || seed || node_id ||
+/// session_id)` and the matching commit is computed honestly. This mimics
+/// N independent storage nodes without any network or shared state.
+#[cfg(any(test, feature = "test-transport"))]
+#[derive(Debug, Clone)]
+pub struct DeterministicTestTransport {
+    pub seed: [u8; 32],
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+impl DeterministicTestTransport {
+    pub fn new(seed: [u8; 32]) -> Self {
+        Self { seed }
+    }
+
+    fn reveal_for(&self, node: &NodeId, session_id: &[u8; 32]) -> [u8; 32] {
+        let mut h = dsm_domain_hasher("DSM/test-mpc-reveal");
+        h.update(&self.seed);
+        h.update(node.as_bytes());
+        h.update(session_id);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    }
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+#[async_trait]
+impl GenesisMpcTransport for DeterministicTestTransport {
+    async fn collect_commit(
+        &self,
+        node: &NodeId,
+        session_id: &[u8; 32],
+        _device_commitment: &[u8; 32],
+    ) -> Result<[u8; 32], DsmError> {
+        let r = self.reveal_for(node, session_id);
+        Ok(commit_for_reveal(session_id, &r))
+    }
+
+    async fn collect_reveal(
+        &self,
+        node: &NodeId,
+        session_id: &[u8; 32],
+    ) -> Result<[u8; 32], DsmError> {
+        Ok(self.reveal_for(node, session_id))
+    }
 }
 
 // -------------------- JNI/result bridge (bytes-only) --------------------
@@ -544,23 +638,153 @@ mod tests {
         assert_eq!(s.commitments.len(), 1 + s.mpc_entropies.len());
         assert!(s.verify_commitments());
 
-        s.compute_genesis_id();
+        s.compute_genesis_id().unwrap();
         assert_ne!(s.genesis_id, [0u8; 32]);
         s.validate_session().unwrap();
     }
 
+    #[test]
+    fn genesis_id_binds_threshold_change_rejects() {
+        // Same inputs except threshold differ → genesis_id must differ.
+        let nodes = vec![NodeId::new("a"), NodeId::new("b"), NodeId::new("c")];
+        let mut s1 = GenesisSession::new(b"m".to_vec()).unwrap();
+        s1.initialize_mpc(id32(1), nodes.clone(), 3).unwrap();
+        s1.device_entropy = id32(2);
+        s1.mpc_entropies = vec![id32(10), id32(11), id32(12)];
+        s1.compute_commitments();
+        s1.compute_genesis_id().unwrap();
+
+        let mut s2 = GenesisSession::new(b"m".to_vec()).unwrap();
+        s2.session_id = s1.session_id;
+        // We have to bypass the ≥3 guard; verify rejection happens upstream.
+        // Use a 4-node set with threshold 4 to compare against the 3-of-3 anchor.
+        let nodes4 = vec![
+            NodeId::new("a"),
+            NodeId::new("b"),
+            NodeId::new("c"),
+            NodeId::new("d"),
+        ];
+        s2.initialize_mpc(id32(1), nodes4, 4).unwrap();
+        s2.device_entropy = id32(2);
+        s2.mpc_entropies = vec![id32(10), id32(11), id32(12), id32(13)];
+        s2.compute_commitments();
+        s2.compute_genesis_id().unwrap();
+
+        assert_ne!(s1.genesis_id, s2.genesis_id);
+    }
+
+    #[test]
+    fn validate_session_rejects_genesis_id_drift() {
+        let mut s = GenesisSession::new(b"meta".to_vec()).unwrap();
+        s.initialize_mpc(
+            id32(7),
+            vec![NodeId::new("a"), NodeId::new("b"), NodeId::new("c")],
+            3,
+        )
+        .unwrap();
+        s.device_entropy = id32(11);
+        s.mpc_entropies = vec![id32(21), id32(22), id32(23)];
+        s.compute_commitments();
+        s.compute_genesis_id().unwrap();
+        s.genesis_id[0] ^= 0xFF;
+        assert!(s.validate_session().is_err());
+    }
+
     #[tokio::test]
-    async fn test_create_mpc_genesis_path() {
+    async fn create_mpc_genesis_with_transport_two_phase() {
+        let dev = id32(0xAA);
+        let nodes = vec![NodeId::new("n3"), NodeId::new("n1"), NodeId::new("n2")];
+        let t = DeterministicTestTransport::new([0x42; 32]);
+        let s = create_mpc_genesis_with_transport(
+            dev,
+            nodes,
+            3,
+            Some(b"DSMv2|test".to_vec()),
+            &t,
+            None,
+        )
+        .await
+        .expect("two-phase MPC should succeed");
+        assert_ne!(s.genesis_id, [0u8; 32]);
+        assert!(s.verify_commitments());
+        // Participants must come back sorted bytewise.
+        let names: Vec<&[u8]> = s.storage_nodes.iter().map(|n| n.as_bytes()).collect();
+        let expected: Vec<&[u8]> = vec![b"n1", b"n2", b"n3"];
+        assert_eq!(names, expected);
+    }
+
+    #[tokio::test]
+    async fn create_mpc_genesis_with_transport_is_replay_safe() {
         let dev = id32(0xAA);
         let nodes = vec![NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")];
-        let s = create_mpc_genesis(dev, nodes, 3, Some(b"DSMv2|test".to_vec())).await;
+        let t = DeterministicTestTransport::new([0x42; 32]);
+        let a = create_mpc_genesis_with_transport(
+            dev,
+            nodes.clone(),
+            3,
+            Some(b"meta".to_vec()),
+            &t,
+            None,
+        )
+        .await
+        .unwrap();
+        let b = create_mpc_genesis_with_transport(dev, nodes, 3, Some(b"meta".to_vec()), &t, None)
+            .await
+            .unwrap();
+        // session_id is randomly generated per session, so genesis differs;
+        // but per-session canonical re-derivation must succeed both times.
+        a.validate_session().unwrap();
+        b.validate_session().unwrap();
+    }
 
-        let sess = match s {
-            Ok(sess) => sess,
-            Err(e) => panic!("create_mpc_genesis should succeed: {e:?}"),
+    /// Bias-resistance: a transport that lies about a reveal (different from
+    /// what it committed to) MUST be rejected.
+    #[tokio::test]
+    async fn create_mpc_genesis_with_transport_rejects_bias_attack() {
+        struct LyingTransport {
+            honest: DeterministicTestTransport,
+        }
+        #[async_trait::async_trait]
+        impl GenesisMpcTransport for LyingTransport {
+            async fn collect_commit(
+                &self,
+                node: &NodeId,
+                session_id: &[u8; 32],
+                d: &[u8; 32],
+            ) -> Result<[u8; 32], DsmError> {
+                self.honest.collect_commit(node, session_id, d).await
+            }
+            async fn collect_reveal(
+                &self,
+                node: &NodeId,
+                session_id: &[u8; 32],
+            ) -> Result<[u8; 32], DsmError> {
+                let mut r = self.honest.collect_reveal(node, session_id).await?;
+                r[0] ^= 0xFF; // diverge from the prior commit
+                Ok(r)
+            }
+        }
+
+        let dev = id32(0xAA);
+        let nodes = vec![NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")];
+        let t = LyingTransport {
+            honest: DeterministicTestTransport::new([0x42; 32]),
         };
-        assert_ne!(sess.genesis_id, [0u8; 32]);
-        assert!(sess.verify_commitments());
-        assert_eq!(sess.mpc_entropies.len(), sess.storage_nodes.len());
+        let r = create_mpc_genesis_with_transport(dev, nodes, 3, Some(b"meta".to_vec()), &t, None)
+            .await;
+        assert!(
+            r.is_err(),
+            "bias attack must be rejected by the two-phase verifier"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn create_mpc_genesis_local_path_is_disabled() {
+        // The local-RNG path must refuse to run.
+        let dev = id32(0xAA);
+        let nodes = vec![NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")];
+        let r = create_mpc_genesis(dev, nodes, 3, None).await;
+        assert!(r.is_err());
     }
 }

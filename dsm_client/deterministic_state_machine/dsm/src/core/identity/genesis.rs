@@ -375,7 +375,7 @@ pub fn create_genesis_via_blind_mpc_with_contributors(
     session.initialize_mpc(device_id, storage_nodes, threshold)?;
     session.set_entropies(device_entropy, mpc_entropies)?;
     session.compute_commitments();
-    session.compute_genesis_id();
+    session.compute_genesis_id()?;
     session.validate_session()?;
 
     let gs = convert_session_to_genesis_state_compat(&session)?;
@@ -522,18 +522,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_genesis_state_creation_mpc_only() {
+        use crate::core::identity::genesis_mpc::{
+            create_mpc_genesis_with_transport, DeterministicTestTransport,
+        };
         let nodes = vec![NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")];
         let device_id = [0xAB; 32];
         let threshold = 3;
-
-        let res =
-            create_genesis_via_blind_mpc(device_id, nodes, threshold, Some(b"test".to_vec())).await;
-
-        let genesis = match res {
-            Ok(g) => g,
-            Err(e) => panic!("create_genesis_via_blind_mpc should succeed: {e:?}"),
-        };
-
+        let transport = DeterministicTestTransport::new([0x42; 32]);
+        let session = create_mpc_genesis_with_transport(
+            device_id,
+            nodes,
+            threshold,
+            Some(b"test".to_vec()),
+            &transport,
+            None,
+        )
+        .await
+        .expect("two-phase MPC should succeed");
+        let genesis = convert_session_to_genesis_state_compat(&session).expect("compat conversion");
         assert_eq!(genesis.threshold, threshold);
         assert_eq!(genesis.hash.len(), 32);
         assert_eq!(genesis.initial_entropy.len(), 32);
@@ -576,18 +582,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_verification_mpc() {
+        use crate::core::identity::genesis_mpc::{
+            create_mpc_genesis_with_transport, DeterministicTestTransport,
+        };
         let nodes = vec![NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")];
         let device_id = [7u8; 32];
-
-        let genesis = match create_genesis_via_blind_mpc(device_id, nodes, 3, None).await {
-            Ok(g) => g,
-            Err(e) => panic!("create_genesis_via_blind_mpc should succeed: {e:?}"),
-        };
-
-        let ok = match verify_genesis_state(&genesis) {
-            Ok(v) => v,
-            Err(e) => panic!("verify_genesis_state should be callable: {e:?}"),
-        };
+        let transport = DeterministicTestTransport::new([0x42; 32]);
+        let session =
+            create_mpc_genesis_with_transport(device_id, nodes, 3, None, &transport, None)
+                .await
+                .expect("two-phase MPC should succeed");
+        let genesis = convert_session_to_genesis_state_compat(&session)
+            .expect("compat conversion should succeed");
+        let ok = verify_genesis_state(&genesis).expect("verify_genesis_state callable");
         assert!(ok);
     }
 
@@ -623,13 +630,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_quantum_resistant_keys() {
+        use crate::core::identity::genesis_mpc::{
+            create_mpc_genesis_with_transport, DeterministicTestTransport,
+        };
         use crate::crypto::sphincs::SphincsVariant;
 
         let nodes = vec![NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")];
         let device_id = [0x11; 32];
+        let transport = DeterministicTestTransport::new([0x42; 32]);
 
-        let g = match create_genesis_via_blind_mpc(device_id, nodes, 3, None).await {
-            Ok(x) => x,
+        let session =
+            match create_mpc_genesis_with_transport(device_id, nodes, 3, None, &transport, None)
+                .await
+            {
+                Ok(x) => x,
+                Err(_) => return,
+            };
+        let g = match convert_session_to_genesis_state_compat(&session) {
+            Ok(g) => g,
             Err(_) => return,
         };
 
